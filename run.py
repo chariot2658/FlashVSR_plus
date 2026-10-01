@@ -22,6 +22,7 @@ parser.add_argument("-f", "--fps", type=int, default=30, help="Output FPS (for i
 parser.add_argument("-q", "--quality", type=int, default=6, help="Output video quality, default=6")
 parser.add_argument("-a", "--attention", default="sage", choices=["sage", "block"], help="Attention mode, default=sage")
 parser.add_argument("--output-height", type=int, default=None, help="Downscale the final stitched video to this height (tiled tiny-long only), default=None (native)")
+parser.add_argument("--output-width", type=int, default=None, help="With --output-height: downscale the stitched video to exactly this width (aspect not preserved, e.g. to square anamorphic DVD pixels), default=None (keep aspect)")
 parser.add_argument("--temp-quality", type=int, default=8, choices=range(1, 11), metavar="[1-10]", help="Quality of per-tile temp videos in tiled tiny-long mode, default=8")
 parser.add_argument("--kv-ratio", type=int, default=3, help="KV cache length of sparse attention; lower saves VRAM at some quality cost, default=3")
 parser.add_argument("--pad-align", action="store_true", help="Pad the upscaled frame to the next multiple of 128 instead of center-cropping, then crop the output back to exactly scale*input size — preserves frame edges on non-tiled runs (tiled-DiT already preserves them)")
@@ -125,7 +126,7 @@ def cli_entry():
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, kv_ratio=args.kv_ratio, seed=args.seed, device=args.device, quality=args.quality, output=final,
-        output_height=args.output_height, temp_quality=args.temp_quality, pad_align=args.pad_align, resume=args.resume)
+        output_height=args.output_height, output_width=args.output_width, temp_quality=args.temp_quality, pad_align=args.pad_align, resume=args.resume)
     if args.mode != "tiny-long":
         # Cropped-back dims are arbitrary even numbers; macro_block_size=2 stops
         # imageio's default 16px auto-resize (same precedent as stitch_video_tiles).

@@ -90,7 +90,7 @@ def init_pipeline(version, mode, device, dtype, accel_plan=None, accel_shape=Non
     pipe.accel_parts = accel.install(pipe, accel_plan, version, accel_shape)
     return pipe
 
-def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, temp_quality=8, pad_align=False, resume=False):
+def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, output_width=None, temp_quality=8, pad_align=False, resume=False):
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -281,7 +281,7 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
         if mode == "tiny-long":
             stitch_video_tiles(tile_paths=temp_videos, tile_coords=tile_coords, final_dims=(W * scale, H * scale),
                 scale=scale, overlap=tile_overlap, output_path=output, fps=_fps, quality=quality, cleanup=True,
-                frame_count=frame_count, output_height=output_height
+                frame_count=frame_count, output_height=output_height, output_width=output_width
             )
             shutil.rmtree(local_temp)
             del pipe

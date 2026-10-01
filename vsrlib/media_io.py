@@ -123,7 +123,7 @@ def prepare_tensors(path: str, dtype=torch.bfloat16):
             h0, w0, _ = first_frame.shape
 
         fps_val = meta.get('fps', 30)
-        fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
+        fps = float(fps_val) if isinstance(fps_val, (int, float)) and fps_val > 0 else 30  # fractional rates kept: int rounding drifts A/V sync
 
         total = meta.get('nframes', rdr.count_frames())
         if total is None or total <= 0 :
@@ -171,7 +171,7 @@ def probe_input(path):
             h0, w0, _ = first_frame.shape
 
             fps_val = meta.get('fps', 30)
-            fps = int(round(fps_val)) if isinstance(fps_val, (int, float)) else 30
+            fps = float(fps_val) if isinstance(fps_val, (int, float)) and fps_val > 0 else 30  # fractional rates kept: int rounding drifts A/V sync
 
             total = meta.get('nframes', None)
             if not isinstance(total, (int, np.integer)) or total <= 0:

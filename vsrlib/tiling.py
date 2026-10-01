@@ -74,6 +74,7 @@ def stitch_video_tiles(
     chunk_size=40,
     frame_count=None,
     output_height=None,
+    output_width=None,
     ram_budget_gb=8.0,
 ):
     if not tile_paths:
@@ -117,6 +118,8 @@ def stitch_video_tiles(
             if output_height < final_H:
                 out_h = output_height - (output_height % 2)
                 out_w = int(round(final_W * out_h / final_H / 2)) * 2
+                if output_width is not None:
+                    out_w = output_width - (output_width % 2)
                 out_size = (out_h, out_w)
                 log(f"[FlashVSR] Stitching at {final_W}x{final_H}, downscaling output to {out_w}x{out_h}", message_type='info')
             else:

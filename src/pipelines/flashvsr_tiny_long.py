@@ -16,7 +16,7 @@ import imageio
 # import pyfiglet
 
 from ..models import ModelManager
-from ..models.utils import clean_vram, FrameStreamBuffer, TensorAsBuffer, tensor_to_imageio_frame
+from ..models.utils import clean_vram, FrameStreamBuffer, TensorAsBuffer, tensor_to_imageio_frame, PrefetchIterator, AsyncFrameWriter
 from ..models.wan_video_dit import WanModel, RMSNorm, sinusoidal_embedding_1d
 from ..models.wan_video_vae import WanVideoVAE, RMS_norm, CausalConv3d, Upsample
 from ..schedulers.flow_match import FlowMatchScheduler
@@ -353,8 +353,10 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                 " pipe.init_cross_kv(context_tensor=your_context_tensor)"
             )
         
+        prefetch = None
         if isinstance(LQ_video, types.GeneratorType):
-            lq_buffer = FrameStreamBuffer(LQ_video, buffer_size=buffer_size, device=self.device, dtype=self.torch_dtype)
+            prefetch = PrefetchIterator(LQ_video, depth=24, device=self.device)
+            lq_buffer = FrameStreamBuffer(prefetch, buffer_size=buffer_size, device=self.device, dtype=self.torch_dtype)
             is_stream_input = True
         elif isinstance(LQ_video, torch.Tensor):
             lq_buffer = TensorAsBuffer(LQ_video)
@@ -397,6 +399,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
             # Cropped dims are arbitrary even numbers; macro_block_size=2 stops
             # imageio's default 16px auto-resize.
             writer = imageio.get_writer(output_path, fps=fps, quality=quality, macro_block_size=2)
+        frame_writer = AsyncFrameWriter(writer)
 
         process_total_num = (num_frames - 1) // 8 - 2
         is_stream = True
@@ -406,6 +409,9 @@ class FlashVSRTinyLongPipeline(BasePipeline):
         self.load_models_to_device(["dit"])
         self.dit.LQ_proj_in.to(self.device)
         self.TCDecoder.to(self.device)
+        from ..models import TCDecoder as _tcd
+        if _tcd.CHANNELS_LAST:
+            self.TCDecoder.to(memory_format=torch.channels_last)
         
         # 清理可能存在的 LQ_proj_in cache
         if hasattr(self.dit, "LQ_proj_in"):
@@ -498,11 +504,7 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                         _t, _l, _oh, _ow = crop_rect
                         cur_frames = cur_frames[:, :, :, _t:_t + _oh, _l:_l + _ow]
 
-                    num_frames_in_chunk = cur_frames.shape[2]
-                    for i in range(num_frames_in_chunk):
-                        single_frame_tensor = cur_frames[0, :, i, :, :]
-                        imageio_frame = tensor_to_imageio_frame(single_frame_tensor)
-                        writer.append_data(imageio_frame)
+                    frame_writer.submit(cur_frames[0])
 
                     LQ_pre_idx = LQ_cur_idx
                     
@@ -529,13 +531,21 @@ class FlashVSRTinyLongPipeline(BasePipeline):
                     # self.TCDecoder.clean_mem()
                     if force_offload:
                         self.offload_model()
-    
+
+            frame_writer.close()  # drains the queue; re-raises a write error here
+
         except Exception as e:
             traceback.print_exc()
             print(f"Error: {e}")
             return False
-                    
+
         finally:
+            try:
+                frame_writer.close()
+            except Exception:
+                pass
+            if prefetch is not None:
+                prefetch.close()
             writer.close()
             
         return True

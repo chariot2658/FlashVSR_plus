@@ -5,6 +5,9 @@ Parts (each gated separately; see README "Acceleration"):
   fp8_dit       DiT linears / FFN in FP8 (torch._scaled_mm + Triton quantization)
   fused_dit     DiT RMSNorm+RoPE and AdaLN fused Triton kernels (bf16)
   fp8_conv_tcd  TCDecoder convolutions in FP8 (cuDNN graph API) -- opt-in only
+  nvfp4_dit     DiT linears / FFN in NVFP4 (Blackwell, two-level scaled E2M1) -- opt-in
+                only (FLASHVSR_NVFP4_DIT=1); replaces fp8_dit when active. Lossier
+                than FP8, faster FFN.
 
 Environment: FLASHVSR_ACCEL=1 requests the first three (run.py --accel sets it);
 FLASHVSR_FP8_CONV / FLASHVSR_FP8_DIT / FLASHVSR_FUSED_DIT =1 request one of them,
@@ -35,11 +38,11 @@ import torch  # noqa: E402  (vsrlib.common first: allocator env var)
 # Bump a part's version whenever its output changes (kernels, calibration table):
 # the version is part of the --resume manifest, so tiles made by an older
 # implementation are not reused.
-PART_VERSIONS = {"fp8_conv_tcd": 1, "fp8_conv_lq": 1, "fp8_dit": 1, "fused_dit": 1}
+PART_VERSIONS = {"fp8_conv_tcd": 1, "fp8_conv_lq": 1, "nvfp4_dit": 1, "fp8_dit": 1, "fused_dit": 1}
 PARTS = tuple(PART_VERSIONS)
 _ENV = {"fp8_conv_tcd": "FLASHVSR_FP8_CONV_TCD", "fp8_conv_lq": "FLASHVSR_FP8_CONV",
-        "fp8_dit": "FLASHVSR_FP8_DIT", "fused_dit": "FLASHVSR_FUSED_DIT"}
-_OPT_IN = frozenset({"fp8_conv_tcd"})  # never enabled by FLASHVSR_ACCEL / enable_all
+        "fp8_dit": "FLASHVSR_FP8_DIT", "fused_dit": "FLASHVSR_FUSED_DIT", "nvfp4_dit": "FLASHVSR_NVFP4_DIT"}
+_OPT_IN = frozenset({"fp8_conv_tcd", "nvfp4_dit"})  # never enabled by FLASHVSR_ACCEL / enable_all
 _CONV = ("fp8_conv_tcd", "fp8_conv_lq")
 _DEFAULT_SHAPE = (512, 512)  # warmup output size when the caller doesn't know it
 
@@ -114,6 +117,13 @@ def preflight(device, dtype, mode, version, enable_all=False):
                 fp8_conv.probe(dev)
         except Exception as e:
             drop(_CONV, f"cuDNN FP8 convolution unavailable ({type(e).__name__}: {e})")
+    if "nvfp4_dit" in parts:
+        try:
+            from . import nvfp4
+            nvfp4.probe(dev)
+            parts.discard("fp8_dit")  # same linears; NVFP4 replaces FP8
+        except Exception as e:
+            drop(("nvfp4_dit",), f"NVFP4 GEMM unavailable ({type(e).__name__}: {e})")
     if "fp8_dit" in parts:
         try:
             from . import accel_dit
@@ -169,6 +179,9 @@ def _forget():
 
 
 def _install_part(part, pipe, version, device, guard):
+    if part == "nvfp4_dit":
+        from .accel_dit import install_nvfp4_dit
+        return install_nvfp4_dit(pipe.dit, device, guard), None
     if part == "fp8_dit":
         from .accel_dit import install_fp8_dit
         return install_fp8_dit(pipe.dit, device, guard), None
@@ -188,7 +201,7 @@ def _install_part(part, pipe, version, device, guard):
 def _warmup(part, pipe, shape):
     th, tw = shape
     dev = pipe.device
-    if part in ("fp8_dit", "fused_dit"):
+    if part in ("nvfp4_dit", "fp8_dit", "fused_dit"):
         from .accel_dit import warmup_dit
         warmup_dit(pipe.dit, 2 * (th // 16) * (tw // 16))  # tokens of a steady 2-latent-frame chunk
     elif part == "fp8_conv_lq":
@@ -257,7 +270,18 @@ def manifest_value(parts):
     non-accelerated runs unchanged)."""
     if not parts:
         return None
-    return [f"{p}@{PART_VERSIONS[p]}" for p in PARTS if p in parts]
+    out = [f"{p}@{PART_VERSIONS[p]}" for p in PARTS if p in parts]
+    if "nvfp4_dit" in parts and nvfp4_scope() != "all":
+        out = [v + f"-{nvfp4_scope()}" if v.startswith("nvfp4_dit@") else v for v in out]
+    return out
+
+
+def nvfp4_scope():
+    """FLASHVSR_NVFP4_SCOPE: "all" (default) or "ffn" (attention linears stay FP8)."""
+    scope = os.environ.get("FLASHVSR_NVFP4_SCOPE", "all")
+    if scope not in ("all", "ffn"):
+        raise ValueError(f"FLASHVSR_NVFP4_SCOPE must be all or ffn, got {scope!r}")
+    return scope
 
 
 def failure_hint():

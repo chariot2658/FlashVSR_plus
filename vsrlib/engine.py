@@ -28,6 +28,26 @@ def _cli_fps():
     import run
     return run.args.fps
 
+def export_tiles(tile_paths, tile_coords, final_dims, scale, overlap, fps, frame_count, out_dir):
+    """Move finished tile videos to <out_dir>/tiles/ and describe them in
+    <out_dir>/tiles.json for vsrlib.stitch_tiles (written last, atomically)."""
+    tiles_dir = os.path.join(out_dir, "tiles")
+    os.makedirs(tiles_dir, exist_ok=True)
+    names = []
+    for p in tile_paths:
+        name = os.path.basename(p)
+        os.replace(p, os.path.join(tiles_dir, name))
+        names.append(name)
+    manifest = {"format": 1, "tiles": names, "coords": [list(c) for c in tile_coords],
+                "final_dims": list(final_dims), "scale": scale, "overlap": overlap,
+                "fps": float(fps), "frame_count": int(frame_count)}
+    path = os.path.join(out_dir, "tiles.json")
+    with open(path + ".part", "w", encoding="utf-8") as f:
+        json.dump(manifest, f, indent=1)
+    os.replace(path + ".part", path)
+    log(f"[FlashVSR] --no-stitch: {len(names)} tile videos in {tiles_dir}", message_type="info")
+
+
 def init_pipeline(version, mode, device, dtype, accel_plan=None, accel_shape=None):
     """Build the pipeline. `accel_plan` is vsrlib.accel.preflight()'s result (None:
     run the preflight here from the environment — the path external workers take);
@@ -90,7 +110,7 @@ def init_pipeline(version, mode, device, dtype, accel_plan=None, accel_shape=Non
     pipe.accel_parts = accel.install(pipe, accel_plan, version, accel_shape)
     return pipe
 
-def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, output_width=None, temp_quality=8, pad_align=False, resume=False):
+def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size, tile_overlap, unload_dit, dtype, sparse_ratio=2, kv_ratio=3, local_range=11, seed=0, device="auto", quality=6, output=None, output_height=None, output_width=None, temp_quality=8, pad_align=False, resume=False, stitch=True):
     _device = device
     if device == "auto":
         _device = "cuda:0" if torch.cuda.is_available() else "mps" if torch.backends.mps.is_available() else device
@@ -278,6 +298,15 @@ def main(input, version, mode, scale, color_fix, tiled_vae, tiled_dit, tile_size
             del LQ_tile, output_tile_gpu, processed_tile_cpu, input_tile
             clean_vram()
 
+        if mode == "tiny-long" and not stitch:
+            # --no-stitch: hand the tile videos to the caller (e.g. a driver that
+            # stitches in the background while the GPU runs the next job).
+            export_tiles(temp_videos, tile_coords, (W * scale, H * scale), scale, tile_overlap,
+                         _fps, frame_count, os.path.dirname(os.path.abspath(output)))
+            shutil.rmtree(local_temp)
+            del pipe
+            clean_vram()
+            return None, _fps
         if mode == "tiny-long":
             stitch_video_tiles(tile_paths=temp_videos, tile_coords=tile_coords, final_dims=(W * scale, H * scale),
                 scale=scale, overlap=tile_overlap, output_path=output, fps=_fps, quality=quality, cleanup=True,

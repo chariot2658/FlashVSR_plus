@@ -14,6 +14,11 @@ from collections import namedtuple
 from einops import rearrange
 import torch.nn.init as init
 
+import os
+# Run the decoder in NHWC so cuDNN needs no layout transposes (same kernels,
+# byte-identical output). FLASHVSR_TCD_CHANNELS_LAST=0 restores NCHW.
+CHANNELS_LAST = os.environ.get("FLASHVSR_TCD_CHANNELS_LAST", "1") != "0"
+
 DecoderResult = namedtuple("DecoderResult", ("frame", "memory"))
 TWorkItem = namedtuple("TWorkItem", ("input_tensor", "block_index"))
 
@@ -122,7 +127,7 @@ def apply_model_with_memblocks(model, x, parallel, show_progress_bar, mem=None):
         x = x.view(N, T, C, H, W)
     else:
         out = []
-        work_queue = [TWorkItem(xt, 0) for t, xt in enumerate(x.reshape(N, T * C, H, W).chunk(T, dim=1))]
+        work_queue = [TWorkItem(xt.contiguous(memory_format=torch.channels_last) if CHANNELS_LAST else xt, 0) for t, xt in enumerate(x.reshape(N, T * C, H, W).chunk(T, dim=1))]
         progress_bar = tqdm(range(T), disable=not show_progress_bar)
         while work_queue:
             xt, i = work_queue.pop(0)

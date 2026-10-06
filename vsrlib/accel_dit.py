@@ -160,3 +160,77 @@ def warmup_dit(dit, tokens):
         wan_video_dit.FUSED_ADALN[0](x, blk.norm1, p, p)
         wan_video_dit.FUSED_ADALN[1](x, p, x)
     torch.cuda.synchronize(dev)
+
+
+class _NVFP4Offload:
+    """Mixin: take part in the pipeline's CPU offload and report runtime failures."""
+
+    def offload(self):
+        self.to("cpu")
+
+    def onload(self):
+        self.to(self._device)
+
+    def forward(self, x):
+        return self._forward(x)
+
+
+def install_nvfp4_dit(dit, device, guard):
+    """NVFP4 counterpart of install_fp8_dit: same linears (self_attn q/k/v/o,
+    cross_attn q/o, FFN), cross_attn k/v stay bf16. q/k/v share one activation
+    quantization. Returns an undo callable."""
+    from . import nvfp4
+
+    class Lin(_NVFP4Offload, nvfp4.NVFP4Linear):
+        def __init__(self, linear, **kw):
+            nvfp4.NVFP4Linear.__init__(self, linear, **kw)
+            self._device = device
+            self._forward = guard(nvfp4.NVFP4Linear.forward.__get__(self))
+
+    class FFN(nvfp4.NVFP4FFN):
+        def __init__(self, lin0, lin2):
+            super().__init__(lin0, lin2)
+            self._forward = guard(super().forward)
+
+        def forward(self, x):
+            return self._forward(x)
+
+    swapped = []
+
+    def swap(parent, name, new):
+        orig = getattr(parent, name)
+        setattr(parent, name, new)
+        orig.to("cpu")
+        swapped.append((parent, name, orig))
+
+    def undo():
+        for parent, name, orig in reversed(swapped):
+            orig.to(device)
+            setattr(parent, name, orig)
+        swapped.clear()
+
+    from .accel import nvfp4_scope
+    ffn_only = nvfp4_scope() == "ffn"  # attention linears stay FP8
+    try:
+        for blk in dit.blocks:
+            sa = blk.self_attn
+            if ffn_only:
+                for attn, names in ((sa, "qkvo"), (blk.cross_attn, "qo")):
+                    for n in names:
+                        swap(attn, n, _FP8Linear(getattr(attn, n), device, guard))
+            else:
+                shared = nvfp4.SharedInput()
+                for n in "qkv":
+                    swap(sa, n, Lin(getattr(sa, n), shared=shared, last=(n == "v")))
+                swap(sa, "o", Lin(sa.o))
+                for n in "qo":
+                    swap(blk.cross_attn, n, Lin(getattr(blk.cross_attn, n)))
+            ffn = blk.ffn
+            if not (isinstance(ffn, nn.Sequential) and len(ffn) == 3 and isinstance(ffn[1], nn.GELU)
+                    and ffn[1].approximate == "tanh"):
+                raise RuntimeError("unexpected DiT FFN layout")
+            swap(blk, "ffn", FFN(Lin(ffn[0]), Lin(ffn[2])))
+    except Exception:
+        undo()
+        raise
+    return undo

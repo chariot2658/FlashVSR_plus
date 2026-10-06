@@ -507,8 +507,137 @@ class FrameStreamBuffer:
             C, H, W = self.buffer[0].shape
             return torch.empty((1, C, 0, H, W), device=self.device, dtype=self.dtype)
 
+        if torch.device(self.device).type == "cuda" and chunk_list[0].device.type == "cpu":
+            # Stack into page-locked memory and upload asynchronously: a pageable
+            # upload makes the CPU wait for all queued GPU work first.
+            C, H, W = chunk_list[0].shape
+            chunk_tensor = torch.empty((C, len(chunk_list), H, W), dtype=chunk_list[0].dtype, pin_memory=True)
+            torch.stack(chunk_list, dim=1, out=chunk_tensor)
+            return chunk_tensor.unsqueeze(0).to(device=self.device, non_blocking=True)
         chunk_tensor = torch.stack(chunk_list, dim=1) # (C, chunk_len, H, W)
         return chunk_tensor.unsqueeze(0).to(device=self.device) # (1, C, chunk_len, H, W)
+
+
+class PrefetchIterator:
+    """Runs a frame generator on a background thread (and its own CUDA stream),
+    keeping up to `depth` items ready, so decoding/upscaling input frames stays off
+    the GPU's critical path. Yields exactly what the generator yields."""
+    _END = object()
+
+    def __init__(self, generator, depth=24, device=None):
+        import queue, threading
+        self._q = queue.Queue(maxsize=depth)
+        self._stop = threading.Event()
+        self._done = False
+        dev = torch.device(device) if device is not None else None
+        self._stream = torch.cuda.Stream(dev) if dev is not None and dev.type == "cuda" else None
+        self._thread = threading.Thread(target=self._run, args=(generator,), daemon=True)
+        self._thread.start()
+
+    def _put(self, item):
+        while not self._stop.is_set():
+            try:
+                self._q.put(item, timeout=0.1)
+                return True
+            except Exception:
+                continue
+        return False
+
+    def _run(self, generator):
+        try:
+            if self._stream is not None:
+                with torch.cuda.stream(self._stream):
+                    for item in generator:
+                        if not self._put(item):
+                            break
+            else:
+                for item in generator:
+                    if not self._put(item):
+                        break
+        except BaseException as e:
+            self._put(("__error__", e))
+        finally:
+            generator.close()
+            self._put(self._END)
+
+    def __iter__(self):
+        return self
+
+    def __next__(self):
+        if self._done:
+            raise StopIteration
+        item = self._q.get()
+        if item is self._END:
+            self._done = True
+            raise StopIteration
+        if isinstance(item, tuple) and len(item) == 2 and item[0] == "__error__":
+            self._done = True
+            raise item[1]
+        return item
+
+    def close(self):
+        self._stop.set()
+        self._thread.join()
+
+
+class AsyncFrameWriter:
+    """Moves decoded frames to the host without blocking and appends them to an
+    imageio writer on a background thread, so the GPU never waits for the encoder.
+    Frame bytes are identical to writing tensor_to_imageio_frame() of each frame."""
+
+    def __init__(self, writer, depth=3):
+        import queue, threading
+        self.writer = writer
+        self._q = queue.Queue(maxsize=depth)
+        self._error = None
+        self._thread = threading.Thread(target=self._run, daemon=True)
+        self._thread.start()
+
+    @staticmethod
+    def to_uint8(frames: torch.Tensor) -> torch.Tensor:
+        """(C, F, H, W) in [-1, 1] -> contiguous (F, H, W, C) uint8, op for op the
+        same arithmetic as tensor_to_imageio_frame."""
+        img = (frames + 1.0) / 2.0
+        img = img.permute(1, 2, 3, 0)
+        return (img * 255.0).clamp(0, 255).to(torch.uint8).contiguous()
+
+    def submit(self, frames: torch.Tensor):
+        """frames: (C, F, H, W) in [-1, 1]."""
+        if self._error is not None:
+            raise self._error
+        u8 = self.to_uint8(frames)
+        if u8.device.type == "cuda":
+            host = torch.empty(u8.shape, dtype=torch.uint8, pin_memory=True)
+            host.copy_(u8, non_blocking=True)
+            event = torch.cuda.Event()
+            event.record()
+        else:
+            host, event = u8, None
+        self._q.put((host, event))
+
+    def _run(self):
+        while True:
+            item = self._q.get()
+            if item is None:
+                return
+            if self._error is not None:
+                continue
+            host, event = item
+            try:
+                if event is not None:
+                    event.synchronize()
+                for frame in host.numpy():
+                    self.writer.append_data(frame)
+            except BaseException as e:
+                self._error = e
+
+    def close(self):
+        """Wait until every submitted frame is written; re-raise a writer error."""
+        if self._thread.is_alive():
+            self._q.put(None)
+            self._thread.join()
+        if self._error is not None:
+            raise self._error
 
 class TensorAsBuffer:
     def __init__(self, tensor: torch.Tensor):

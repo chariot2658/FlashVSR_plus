@@ -27,6 +27,7 @@ parser.add_argument("--temp-quality", type=int, default=8, choices=range(1, 11),
 parser.add_argument("--kv-ratio", type=int, default=3, help="KV cache length of sparse attention; lower saves VRAM at some quality cost, default=3")
 parser.add_argument("--pad-align", action="store_true", help="Pad the upscaled frame to the next multiple of 128 instead of center-cropping, then crop the output back to exactly scale*input size — preserves frame edges on non-tiled runs (tiled-DiT already preserves them)")
 parser.add_argument("--resume", action="store_true", help="Resume an interrupted tiled tiny-long run: keep _temp at startup and reuse completed tile videos from a previous run with identical parameters")
+parser.add_argument("--no-stitch", action="store_true", help="Tiled tiny-long only: skip stitching; move the tile videos to <output_folder>/tiles/ and describe them in tiles.json (stitch later with python -m vsrlib.stitch_tiles)")
 parser.add_argument("--accel", action="store_true", help="Speed up inference with FP8 convolutions/linears and fused DiT kernels (RTX 40 series or newer, bf16; falls back to the standard path automatically). Same as FLASHVSR_ACCEL=1; the output differs slightly from a run without it")
 parser.add_argument("output_folder", type=str, help="Path to save output video")
 args = parser.parse_args()
@@ -126,12 +127,16 @@ def cli_entry():
     final = os.path.join(args.output_folder, f"FlashVSR_{args.mode}_{name.split('.')[0]}_{args.seed}.mp4")
     result, fps = main(args.input, args.version, args.mode, args.scale, args.color_fix, args.tiled_vae, args.tiled_dit,args.tile_size,
         args.overlap, args.unload_dit, dtype, kv_ratio=args.kv_ratio, seed=args.seed, device=args.device, quality=args.quality, output=final,
-        output_height=args.output_height, output_width=args.output_width, temp_quality=args.temp_quality, pad_align=args.pad_align, resume=args.resume)
+        output_height=args.output_height, output_width=args.output_width, temp_quality=args.temp_quality, pad_align=args.pad_align, resume=args.resume,
+        stitch=not args.no_stitch)
     if args.mode != "tiny-long":
         # Cropped-back dims are arbitrary even numbers; macro_block_size=2 stops
         # imageio's default 16px auto-resize (same precedent as stitch_video_tiles).
         save_video(result, final, fps=fps, quality=args.quality, macro_block_size=2 if args.pad_align else None)
 
+    if args.no_stitch and args.mode == "tiny-long" and args.tiled_dit:
+        log("[FlashVSR] Done (tiles only).", message_type='finish')
+        return
     merge_video_with_audio(final, args.input)
     log("[FlashVSR] Done.", message_type='finish')
 
